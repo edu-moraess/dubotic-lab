@@ -9,7 +9,6 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import av
 import numpy as np
@@ -25,6 +24,7 @@ from vision.coordinate_mapping import CameraBounds, CoordinateMapper, WorkspaceB
 from vision.gestures import Gesture, GestureRecognizer
 from vision.hand_tracking import HandTracker
 from vision.safety import evaluate_motion, target_in_workspace, valid_landmarks
+from vision.smoothing import ExponentialSmoother
 
 st.set_page_config(page_title="Dubotic Lab — Live Hand Tracking", page_icon="🤖", layout="centered")
 
@@ -54,7 +54,6 @@ class LiveHandProcessor(VideoProcessorBase):
             workspace=WorkspaceBounds(-180, 180, -120, 120, z=50.0),
             invert_v=True,
         )
-        from vision.smoothing import ExponentialSmoother
         self.smoother = ExponentialSmoother(alpha=0.35, dim=3)
         self.tracker = HandTracker(max_hands=1, draw=True)
         self.recognizer = GestureRecognizer()
@@ -72,13 +71,12 @@ class LiveHandProcessor(VideoProcessorBase):
         rgb = frame.to_ndarray(format="rgb24")
         h, w = rgb.shape[:2]
         if (w, h) != (640, 480):
-            image = Image.fromarray(rgb).resize((640, 480))
-            rgb = np.asarray(image)
+            rgb = np.asarray(Image.fromarray(rgb).resize((640, 480)))
 
         out = self.tracker.process(rgb)
-        self._set(frames=self.state.frames + 1)
-        now = time.monotonic()
         with self.state.lock:
+            self.state.frames += 1
+            now = time.monotonic()
             previous = self.state.last_time
             self.state.last_time = now
             if previous > 0:
@@ -86,25 +84,24 @@ class LiveHandProcessor(VideoProcessorBase):
                 if dt > 0:
                     self.state.fps = 0.9 * self.state.fps + 0.1 * (1.0 / dt)
 
+        annotated = out.annotated_image if out.annotated_image is not None else rgb.copy()
         if not out.has_hand:
-            self._set(status="NO HAND", gesture="UNKNOWN", confidence=0.0,
-                      safety="HOLD — no hand", ik_ok=False)
-            return av.VideoFrame.from_ndarray(out.annotated_image if out.annotated_image is not None else rgb, format="rgb24")
+            self._set(status="NO HAND", gesture="UNKNOWN", confidence=0.0, safety="HOLD — no hand", ik_ok=False)
+            return av.VideoFrame.from_ndarray(annotated, format="rgb24")
 
         hand = out.primary
         if hand is None or not valid_landmarks(hand.landmarks):
             self._set(status="INVALID LANDMARKS", safety="HOLD — invalid landmarks", ik_ok=False)
-            return av.VideoFrame.from_ndarray(out.annotated_image if out.annotated_image is not None else rgb, format="rgb24")
+            return av.VideoFrame.from_ndarray(annotated, format="rgb24")
 
         gesture = self.recognizer.recognize(hand.landmarks)
         self._set(status="ACTIVE", gesture=gesture.gesture.name, confidence=float(gesture.confidence))
 
-        annotated = out.annotated_image if out.annotated_image is not None else rgb.copy()
         overlay = Image.fromarray(annotated).convert("RGB")
         draw = ImageDraw.Draw(overlay)
         px = hand.index_tip_px
         r = 9
-        draw.ellipse((px[0]-r, px[1]-r, px[0]+r, px[1]+r), fill=(255, 60, 60), outline=(255, 255, 255), width=2)
+        draw.ellipse((px[0] - r, px[1] - r, px[0] + r, px[1] + r), fill=(255, 60, 60), outline=(255, 255, 255), width=2)
         annotated = np.asarray(overlay)
 
         if gesture.gesture == Gesture.STOP:
@@ -181,7 +178,6 @@ def main():
         )
 
     state = st.session_state.live_state
-
     ctx = webrtc_streamer(
         key="dubotic-live-hand",
         mode=WebRtcMode.SENDRECV,
@@ -193,7 +189,7 @@ def main():
 
     if ctx.state.playing:
         st.success("LIVE — câmera conectada")
-        metrics = st.empty()
+        telemetry = st.empty()
         robot_box = st.empty()
         while ctx.state.playing:
             with state.lock:
@@ -207,27 +203,16 @@ def main():
                 ik_error = state.ik_error
                 fps = state.fps
 
-            cols = st.columns(4)
-            cols[0].metric("Status", status)
-            cols[1].metric("Gesture", gesture)
-            cols[2].metric("Confidence", f"{confidence:.2f}")
-            cols[3].metric("FPS", f"{fps:.1f}")
-            metrics.write(
-                f"**Target:** X={target[0]:.1f} · Y={target[1]:.1f} · Z={target[2]:.1f} mm  |  "
-                f"**IK:** {'VALID' if ik_ok else 'HOLD'}  |  "
-                f"error={ik_error:.2f} mm  |  **Safety:** {safety}"
+            telemetry.markdown(
+                f"**{status}** · gesto **{gesture}** · confiança **{confidence:.2f}** · FPS **{fps:.1f}**\n\n"
+                f"**Target:** X={target[0]:.1f} · Y={target[1]:.1f} · Z={target[2]:.1f} mm  · "
+                f"**IK:** {'VALID' if ik_ok else 'HOLD'} · erro={ik_error:.2f} mm  · **Safety:** {safety}"
             )
-
-            fig = create_robot_figure(
-                model,
-                joints,
-                target=target,
-                title="Live Hand Control · 3-DOF Arm",
-            )
+            fig = create_robot_figure(model, joints, target=target, title="Live Hand Control · 3-DOF Arm")
             robot_box.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             time.sleep(0.10)
     else:
-        st.warning("Press START above para abrir a câmera. Em celular, permita acesso à câmera quando solicitado.")
+        st.warning("Press START acima para abrir a câmera. Em celular, permita acesso à câmera quando solicitado.")
 
     st.caption("Arquitetura: câmera → MediaPipe → index tip → EMA → target → IK → trajetória → robô")
 
