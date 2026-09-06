@@ -209,7 +209,12 @@ def main():
                 f"**IK:** {'VALID' if ik_ok else 'HOLD'} · erro={ik_error:.2f} mm  · **Safety:** {safety}"
             )
             fig = create_robot_figure(model, joints, target=target, title="Live Hand Control · 3-DOF Arm")
-            robot_box.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            robot_box.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key="live_robot_plot",
+            )
             time.sleep(0.10)
     else:
         st.warning("Press START acima para abrir a câmera. Em celular, permita acesso à câmera quando solicitado.")
