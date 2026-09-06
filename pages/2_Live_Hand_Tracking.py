@@ -1,8 +1,4 @@
-"""Dubotic Lab v0.3 — real-time browser hand tracking.
-
-Uses streamlit-webrtc for a continuous camera stream. The existing robotics
-core is reused: hand -> target -> IK -> trajectory -> robot state.
-"""
+"""Dubotic Lab v0.3.1 — lightweight real-time browser hand tracking."""
 
 from __future__ import annotations
 
@@ -11,9 +7,9 @@ import time
 from dataclasses import dataclass
 
 import av
+import cv2
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw
 from streamlit_webrtc import WebRtcMode, VideoProcessorBase, webrtc_streamer
 
 from robotics.inverse_kinematics import inverse_kinematics, is_reachable
@@ -46,6 +42,8 @@ class LiveState:
 
 
 class LiveHandProcessor(VideoProcessorBase):
+    """Runs the complete hand -> target -> IK pipeline in the WebRTC worker."""
+
     def __init__(self, state: LiveState):
         self.state = state
         self.model = RobotModel.default_3dof()
@@ -55,7 +53,9 @@ class LiveHandProcessor(VideoProcessorBase):
             invert_v=True,
         )
         self.smoother = ExponentialSmoother(alpha=0.35, dim=3)
-        self.tracker = HandTracker(max_hands=1, draw=True)
+        # Drawing MediaPipe's complete skeleton on every frame wastes CPU.
+        # The live page draws only the index fingertip itself.
+        self.tracker = HandTracker(max_hands=1, draw=False)
         self.recognizer = GestureRecognizer()
         self.planner = TrajectoryPlanner(self.model, default_duration=0.15)
         self.trajectory = None
@@ -70,21 +70,24 @@ class LiveHandProcessor(VideoProcessorBase):
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         rgb = frame.to_ndarray(format="rgb24")
         h, w = rgb.shape[:2]
-        if (w, h) != (640, 480):
-            rgb = np.asarray(Image.fromarray(rgb).resize((640, 480)))
 
+        # The browser is requested to send 640x480, so avoid a PIL resize on
+        # every frame. If a browser sends another size, map against its actual
+        # dimensions instead of paying for an image copy.
         out = self.tracker.process(rgb)
+
+        now = time.monotonic()
         with self.state.lock:
             self.state.frames += 1
-            now = time.monotonic()
             previous = self.state.last_time
             self.state.last_time = now
             if previous > 0:
                 dt = now - previous
                 if dt > 0:
-                    self.state.fps = 0.9 * self.state.fps + 0.1 * (1.0 / dt)
+                    instant = 1.0 / dt
+                    self.state.fps = instant if self.state.fps == 0 else 0.9 * self.state.fps + 0.1 * instant
 
-        annotated = out.annotated_image if out.annotated_image is not None else rgb.copy()
+        annotated = rgb.copy()
         if not out.has_hand:
             self._set(status="NO HAND", gesture="UNKNOWN", confidence=0.0, safety="HOLD — no hand", ik_ok=False)
             return av.VideoFrame.from_ndarray(annotated, format="rgb24")
@@ -97,20 +100,26 @@ class LiveHandProcessor(VideoProcessorBase):
         gesture = self.recognizer.recognize(hand.landmarks)
         self._set(status="ACTIVE", gesture=gesture.gesture.name, confidence=float(gesture.confidence))
 
-        overlay = Image.fromarray(annotated).convert("RGB")
-        draw = ImageDraw.Draw(overlay)
+        # Lightweight overlay: only the control point, not the full MediaPipe skeleton.
         px = hand.index_tip_px
-        r = 9
-        draw.ellipse((px[0] - r, px[1] - r, px[0] + r, px[1] + r), fill=(255, 60, 60), outline=(255, 255, 255), width=2)
-        annotated = np.asarray(overlay)
+        cv2.circle(annotated, (int(px[0]), int(px[1])), 9, (255, 60, 60), -1)
+        cv2.circle(annotated, (int(px[0]), int(px[1])), 9, (255, 255, 255), 2)
 
         if gesture.gesture == Gesture.STOP:
             self.trajectory = None
+            self.last_target = None
             self._set(status="STOP", safety="HOLD — STOP gesture", ik_ok=False)
             return av.VideoFrame.from_ndarray(annotated, format="rgb24")
 
         try:
-            raw = self.mapper.pixel_to_workspace(float(px[0]), float(px[1]))
+            # CoordinateMapper expects the camera dimensions configured above.
+            # Keep browser input at 640x480 for deterministic mapping.
+            if (w, h) != (640, 480):
+                px_x = float(px[0]) * 640.0 / max(w, 1)
+                px_y = float(px[1]) * 480.0 / max(h, 1)
+            else:
+                px_x, px_y = float(px[0]), float(px[1])
+            raw = self.mapper.pixel_to_workspace(px_x, px_y)
             target = self.smoother.update(raw)
         except (TypeError, ValueError):
             self._set(safety="HOLD — invalid target", ik_ok=False)
@@ -136,10 +145,12 @@ class LiveHandProcessor(VideoProcessorBase):
             self._set(target=target.copy(), safety=f"HOLD — {decision.reason}", ik_ok=False)
             return av.VideoFrame.from_ndarray(annotated, format="rgb24")
 
-        if self.last_target is None or np.linalg.norm(target - self.last_target) > 1.0:
+        # Replan only after a meaningful target displacement. This prevents
+        # rebuilding a trajectory on every camera frame.
+        if self.last_target is None or np.linalg.norm(target - self.last_target) > 4.0:
             with self.state.lock:
                 current = self.state.joint_angles.copy()
-            self.trajectory = self.planner.plan(current, ik.joint_angles, n_points=8)
+            self.trajectory = self.planner.plan(current, ik.joint_angles, n_points=6)
             self.traj_index = 0
             self.last_target = target.copy()
 
@@ -165,7 +176,6 @@ def get_model() -> RobotModel:
 
 
 def render_live_ui(state: LiveState, model: RobotModel):
-    """Refresh telemetry and robot visualization without creating duplicate elements."""
     with state.lock:
         target = state.target.copy()
         joints = state.joint_angles.copy()
@@ -179,8 +189,8 @@ def render_live_ui(state: LiveState, model: RobotModel):
 
     st.markdown(
         f"**{status}** · gesto **{gesture}** · confiança **{confidence:.2f}** · FPS **{fps:.1f}**\n\n"
-        f"**Target:** X={target[0]:.1f} · Y={target[1]:.1f} · Z={target[2]:.1f} mm  · "
-        f"**IK:** {'VALID' if ik_ok else 'HOLD'} · erro={ik_error:.2f} mm  · **Safety:** {safety}"
+        f"**Target:** X={target[0]:.1f} · Y={target[1]:.1f} · Z={target[2]:.1f} mm · "
+        f"**IK:** {'VALID' if ik_ok else 'HOLD'} · erro={ik_error:.2f} mm · **Safety:** {safety}"
     )
     fig = create_robot_figure(model, joints, target=target, title="Live Hand Control · 3-DOF Arm")
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
@@ -188,8 +198,8 @@ def render_live_ui(state: LiveState, model: RobotModel):
 
 def main():
     st.title("DUBOTIC LAB")
-    st.caption("v0.3 · Real-Time Hand Tracking")
-    st.info("Câmera contínua: mova o dedo indicador e o braço virtual acompanha. Z permanece fixo no plano de trabalho.")
+    st.caption("v0.3.1 · Real-Time Hand Tracking")
+    st.info("Câmera contínua: dedo indicador → target → IK → braço virtual. Z permanece fixo em 50 mm.")
 
     model = get_model()
     if "live_state" not in st.session_state:
@@ -204,7 +214,7 @@ def main():
         key="dubotic-live-hand",
         mode=WebRtcMode.SENDRECV,
         video_processor_factory=lambda: LiveHandProcessor(state),
-        media_stream_constraints={"video": {"width": 640, "height": 480}, "audio": False},
+        media_stream_constraints={"video": {"width": 640, "height": 480, "frameRate": 20}, "audio": False},
         rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
         async_processing=True,
     )
@@ -212,10 +222,7 @@ def main():
     if ctx.state.playing:
         st.success("LIVE — câmera conectada")
 
-        # Streamlit reruns this fragment periodically while WebRTC keeps
-        # processing frames in its own worker thread. This avoids repeatedly
-        # registering the same Plotly element/key inside a while loop.
-        @st.fragment(run_every="0.1s")
+        @st.fragment(run_every="0.5s")
         def live_panel():
             render_live_ui(state, model)
 
@@ -223,7 +230,7 @@ def main():
     else:
         st.warning("Press START acima para abrir a câmera. Em celular, permita acesso à câmera quando solicitado.")
 
-    st.caption("Arquitetura: câmera → MediaPipe → index tip → EMA → target → IK → trajetória → robô")
+    st.caption("Pipeline: câmera → MediaPipe tracking → index tip → EMA → target → IK → trajetória → robô")
 
 
 if __name__ == "__main__":
