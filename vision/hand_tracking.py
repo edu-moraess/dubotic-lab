@@ -30,11 +30,11 @@ class LandmarkIndex(IntEnum):
 class HandResult:
     """Single detected hand."""
 
-    landmarks: np.ndarray  # (21, 3) normalised [x, y, z_rel]
-    landmarks_px: np.ndarray  # (21, 2) pixel coordinates
-    handedness: str  # "Left" / "Right"
+    landmarks: np.ndarray
+    landmarks_px: np.ndarray
+    handedness: str
     confidence: float
-    image_size: Tuple[int, int]  # (width, height)
+    image_size: Tuple[int, int]
 
     @property
     def index_tip_px(self) -> np.ndarray:
@@ -48,7 +48,7 @@ class HandResult:
 @dataclass
 class TrackerOutput:
     hands: List[HandResult] = field(default_factory=list)
-    annotated_image: Optional[np.ndarray] = None  # RGB with drawings
+    annotated_image: Optional[np.ndarray] = None
 
     @property
     def primary(self) -> Optional[HandResult]:
@@ -60,16 +60,7 @@ class TrackerOutput:
 
 
 class HandTracker:
-    """
-    Detects up to `max_hands` hands in an RGB image.
-
-    Parameters
-    ----------
-    max_hands : int
-    min_detection_confidence : float
-    min_tracking_confidence : float
-    draw : bool  — whether to return annotated image
-    """
+    """Detects up to `max_hands` hands in an RGB image."""
 
     def __init__(
         self,
@@ -95,7 +86,9 @@ class HandTracker:
             self._mp_hands = mp.solutions.hands
             self._mp_drawing = mp.solutions.drawing_utils
             self._hands = self._mp_hands.Hands(
-                static_image_mode=True,
+                # Critical for live video: keep temporal tracking enabled.
+                # static_image_mode=True forces a fresh detection on every frame.
+                static_image_mode=False,
                 max_num_hands=self.max_hands,
                 min_detection_confidence=self.min_detection_confidence,
                 min_tracking_confidence=self.min_tracking_confidence,
@@ -114,14 +107,8 @@ class HandTracker:
         return self._backend == "mediapipe"
 
     def process(self, image_rgb: np.ndarray) -> TrackerOutput:
-        """
-        Process one RGB frame (H, W, 3), dtype uint8.
-
-        Returns TrackerOutput (possibly empty).
-        """
         if image_rgb is None or image_rgb.size == 0:
             return TrackerOutput()
-
         if self._hands is None:
             return TrackerOutput()
 
