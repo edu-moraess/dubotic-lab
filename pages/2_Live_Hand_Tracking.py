@@ -164,6 +164,28 @@ def get_model() -> RobotModel:
     return RobotModel.default_3dof()
 
 
+def render_live_ui(state: LiveState, model: RobotModel):
+    """Refresh telemetry and robot visualization without creating duplicate elements."""
+    with state.lock:
+        target = state.target.copy()
+        joints = state.joint_angles.copy()
+        gesture = state.gesture
+        confidence = state.confidence
+        status = state.status
+        safety = state.safety
+        ik_ok = state.ik_ok
+        ik_error = state.ik_error
+        fps = state.fps
+
+    st.markdown(
+        f"**{status}** · gesto **{gesture}** · confiança **{confidence:.2f}** · FPS **{fps:.1f}**\n\n"
+        f"**Target:** X={target[0]:.1f} · Y={target[1]:.1f} · Z={target[2]:.1f} mm  · "
+        f"**IK:** {'VALID' if ik_ok else 'HOLD'} · erro={ik_error:.2f} mm  · **Safety:** {safety}"
+    )
+    fig = create_robot_figure(model, joints, target=target, title="Live Hand Control · 3-DOF Arm")
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
 def main():
     st.title("DUBOTIC LAB")
     st.caption("v0.3 · Real-Time Hand Tracking")
@@ -189,33 +211,15 @@ def main():
 
     if ctx.state.playing:
         st.success("LIVE — câmera conectada")
-        telemetry = st.empty()
-        robot_box = st.empty()
-        while ctx.state.playing:
-            with state.lock:
-                target = state.target.copy()
-                joints = state.joint_angles.copy()
-                gesture = state.gesture
-                confidence = state.confidence
-                status = state.status
-                safety = state.safety
-                ik_ok = state.ik_ok
-                ik_error = state.ik_error
-                fps = state.fps
 
-            telemetry.markdown(
-                f"**{status}** · gesto **{gesture}** · confiança **{confidence:.2f}** · FPS **{fps:.1f}**\n\n"
-                f"**Target:** X={target[0]:.1f} · Y={target[1]:.1f} · Z={target[2]:.1f} mm  · "
-                f"**IK:** {'VALID' if ik_ok else 'HOLD'} · erro={ik_error:.2f} mm  · **Safety:** {safety}"
-            )
-            fig = create_robot_figure(model, joints, target=target, title="Live Hand Control · 3-DOF Arm")
-            robot_box.plotly_chart(
-                fig,
-                use_container_width=True,
-                config={"displayModeBar": False},
-                key="live_robot_plot",
-            )
-            time.sleep(0.10)
+        # Streamlit reruns this fragment periodically while WebRTC keeps
+        # processing frames in its own worker thread. This avoids repeatedly
+        # registering the same Plotly element/key inside a while loop.
+        @st.fragment(run_every="0.1s")
+        def live_panel():
+            render_live_ui(state, model)
+
+        live_panel()
     else:
         st.warning("Press START acima para abrir a câmera. Em celular, permita acesso à câmera quando solicitado.")
 
