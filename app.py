@@ -1,0 +1,622 @@
+"""
+DUBOTIC LAB – Interactive Robotics Simulation Laboratory
+Mobile-first Streamlit front-end.
+
+v0.2 — Hand Tracking Control
+  Camera → Hand Tracking → Index Finger → Coordinate Mapping → Target → IK → Robot
+"""
+
+from __future__ import annotations
+
+import streamlit as st
+import numpy as np
+from PIL import Image
+
+from robotics.models import RobotModel
+from robotics.kinematics import forward_kinematics, update_state_from_fk
+from robotics.inverse_kinematics import inverse_kinematics, is_reachable
+from robotics.trajectory import TrajectoryPlanner
+from robotics.controller import PIDController
+from robotics.simulation import Simulation, JointPositionSensor
+
+from visualization.robot_plot import create_robot_figure
+from visualization.workspace_plot import sample_workspace, create_workspace_figure
+from visualization.trajectory_plot import create_trajectory_plots
+
+from scenes.laboratory import LaboratoryScene
+from scenes.roblox import RobloxScene
+from scenes.tetris import TetrisScene
+
+from vision.coordinate_mapping import CoordinateMapper, CameraBounds, WorkspaceBounds
+from vision.smoothing import ExponentialSmoother
+from vision.gestures import Gesture, GestureRecognizer
+from vision.hand_tracking import HandTracker
+from vision.demo import SyntheticHandGenerator
+from vision.safety import evaluate_motion, valid_landmarks, target_in_workspace
+
+
+# ---------------------------------------------------------------------------
+# Page config – mobile friendly
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Dubotic Lab",
+    page_icon="🤖",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+
+st.markdown(
+    """
+    <style>
+    .stSlider > div { padding-top: 0.4rem; padding-bottom: 0.4rem; }
+    .stButton > button {
+        width: 100%;
+        height: 3rem;
+        font-size: 1.05rem;
+        border-radius: 0.5rem;
+    }
+    div[data-testid="stMetric"] {
+        background-color: #1a1f2e;
+        padding: 0.6rem;
+        border-radius: 0.4rem;
+    }
+    h1 { font-size: 1.6rem !important; margin-bottom: 0.2rem; }
+    h2, h3 { font-size: 1.15rem !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Cached resources
+# ---------------------------------------------------------------------------
+@st.cache_resource
+def get_model() -> RobotModel:
+    return RobotModel.default_3dof()
+
+
+@st.cache_data(show_spinner=False)
+def get_workspace_points(_model: RobotModel) -> np.ndarray:
+    return sample_workspace(_model, n_samples_per_joint=10)
+
+
+@st.cache_resource
+def get_hand_tracker() -> HandTracker:
+    return HandTracker(max_hands=1, draw=True)
+
+
+@st.cache_resource
+def get_gesture_recognizer() -> GestureRecognizer:
+    return GestureRecognizer()
+
+
+SCENES = {
+    "Laboratory": LaboratoryScene(),
+    "Roblox-style": RobloxScene(),
+    "Tetris-style": TetrisScene(),
+}
+
+
+def deg(rad: float) -> float:
+    return float(np.degrees(rad))
+
+
+def rad(deg_val: float) -> float:
+    return float(np.radians(deg_val))
+
+
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
+def init_state(model: RobotModel):
+    defaults = {
+        "joint_angles": np.zeros(model.joint_count),
+        "target": np.array([150.0, 0.0, 150.0]),
+        "last_ik": None,
+        "trajectory": None,
+        "traj_history": None,
+        "mode": "Manual Control",
+        "scene_name": "Laboratory",
+        "task": "Free Move",
+        "noise_on": False,
+        "status_msg": "",
+        "status_type": "info",
+        "hand_enabled": False,
+        "hand_demo": False,
+        "hand_smoothing": 0.35,
+        "hand_gesture": "UNKNOWN",
+        "hand_confidence": 0.0,
+        "hand_status": "NO HAND",
+        "last_valid_target": np.array([150.0, 0.0, 50.0]),
+        "gesture_fsm": "IDLE",
+        "demo_t": 0.0,
+        "hand_smoother": None,
+        "hand_annotated": None,
+        "hand_ik_status": "NOT RUNNING",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+# ---------------------------------------------------------------------------
+# Hand-tracking pipeline
+# ---------------------------------------------------------------------------
+def _process_hand_frame(
+    image_rgb: np.ndarray,
+    model: RobotModel,
+    mapper: CoordinateMapper,
+    smoother: ExponentialSmoother,
+) -> None:
+    """Run camera → landmarks → target → IK → smooth trajectory safely."""
+    tracker = get_hand_tracker()
+    recognizer = get_gesture_recognizer()
+    out = tracker.process(image_rgb)
+    st.session_state.hand_annotated = out.annotated_image
+
+    if not out.has_hand:
+        st.session_state.hand_status = "NO HAND"
+        st.session_state.hand_gesture = "UNKNOWN"
+        st.session_state.hand_confidence = 0.0
+        st.session_state.hand_ik_status = "HOLD — no hand"
+        return
+
+    hand = out.primary
+    assert hand is not None
+    st.session_state.hand_annotated = image_rgb.copy() if out.annotated_image is None else out.annotated_image
+    if st.session_state.hand_annotated is not None:
+        overlay = Image.fromarray(st.session_state.hand_annotated.astype(np.uint8)).convert("RGB")
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(overlay)
+        px = hand.index_tip_px
+        r = 8
+        draw.ellipse((float(px[0]) - r, float(px[1]) - r, float(px[0]) + r, float(px[1]) + r), fill=(255, 60, 60), outline=(255, 255, 255), width=2)
+        st.session_state.hand_annotated = np.asarray(overlay)
+
+    if not valid_landmarks(hand.landmarks):
+        st.session_state.hand_status = "INVALID LANDMARKS"
+        st.session_state.hand_ik_status = "HOLD — invalid landmarks"
+        return
+
+    gstate = recognizer.recognize(hand.landmarks)
+    st.session_state.hand_gesture = gstate.gesture.name
+    st.session_state.hand_confidence = gstate.confidence
+    st.session_state.hand_status = "ACTIVE"
+
+    if gstate.gesture == Gesture.STOP:
+        st.session_state.gesture_fsm = "IDLE"
+        st.session_state.hand_ik_status = "HOLD — STOP"
+        st.session_state.status_msg = "STOP gesture — motion held"
+        st.session_state.status_type = "info"
+        return
+
+    try:
+        raw_target = mapper.pixel_to_workspace(float(hand.index_tip_px[0]), float(hand.index_tip_px[1]))
+        smoothed = smoother.update(raw_target)
+    except (TypeError, ValueError):
+        st.session_state.hand_ik_status = "HOLD — invalid target"
+        return
+
+    if not target_in_workspace(smoothed, mapper.workspace):
+        st.session_state.hand_ik_status = "HOLD — target outside workspace"
+        return
+
+    st.session_state.last_valid_target = smoothed.copy()
+    st.session_state.target = smoothed.copy()
+    if gstate.gesture == Gesture.GRAB:
+        st.session_state.gesture_fsm = "GRAB"
+    elif gstate.gesture == Gesture.RELEASE:
+        st.session_state.gesture_fsm = "RELEASE"
+    elif gstate.gesture == Gesture.MOVE:
+        st.session_state.gesture_fsm = "MOVE"
+
+    if gstate.gesture not in (Gesture.MOVE, Gesture.GRAB):
+        st.session_state.hand_ik_status = "HOLD — gesture does not command motion"
+        return
+
+    ik = inverse_kinematics(model, smoothed) if is_reachable(model, smoothed) else None
+    st.session_state.last_ik = ik
+    decision = evaluate_motion(
+        hand_present=True,
+        landmarks=hand.landmarks,
+        target=smoothed,
+        workspace=mapper.workspace,
+        ik_success=bool(ik is not None and ik.success and ik.joint_angles is not None),
+    )
+    if not decision.allow_motion or ik is None or ik.joint_angles is None:
+        st.session_state.hand_ik_status = f"HOLD — {decision.reason}"
+        return
+
+    planner = TrajectoryPlanner(model, default_duration=0.25)
+    st.session_state.trajectory = planner.plan(
+        st.session_state.joint_angles, ik.joint_angles, n_points=20
+    )
+    st.session_state.joint_angles = st.session_state.trajectory.position[-1].copy()
+    st.session_state.hand_ik_status = f"VALID — trajectory {st.session_state.trajectory.n_points} points"
+
+
+def _run_demo_hand(model: RobotModel, mapper: CoordinateMapper, smoother: ExponentialSmoother):
+    """Simulation mode — synthetic landmarks, clearly labelled."""
+    gen = SyntheticHandGenerator()
+    st.session_state.demo_t += 0.15
+    hand = gen.generate_moving(st.session_state.demo_t, gesture="MOVE")
+    tip = hand.index_tip_px
+    raw = mapper.pixel_to_workspace(float(tip[0]), float(tip[1]))
+    smoothed = smoother.update(raw)
+    st.session_state.target = smoothed
+    st.session_state.last_valid_target = smoothed.copy()
+    st.session_state.hand_status = "SIMULATION"
+    st.session_state.hand_gesture = "MOVE"
+    st.session_state.hand_confidence = 1.0
+    st.session_state.gesture_fsm = "MOVE"
+
+    if is_reachable(model, smoothed):
+        ik = inverse_kinematics(model, smoothed)
+        if ik.success and ik.joint_angles is not None:
+            st.session_state.joint_angles = ik.joint_angles.copy()
+            st.session_state.last_ik = ik
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    model = get_model()
+    init_state(model)
+
+    st.title("DUBOTIC LAB")
+    st.caption("«Robotics Simulation Laboratory» · v0.2 Hand Tracking")
+
+    # ---- Scene ----
+    scene_name = st.selectbox(
+        "SCENE",
+        list(SCENES.keys()),
+        index=list(SCENES.keys()).index(st.session_state.scene_name),
+    )
+    st.session_state.scene_name = scene_name
+    scene = SCENES[scene_name]
+
+    # ---- Control Mode ----
+    mode = st.selectbox(
+        "CONTROL MODE",
+        ["Manual Control", "Target Position", "Hand Tracking"],
+        index=["Manual Control", "Target Position", "Hand Tracking"].index(
+            st.session_state.mode
+        )
+        if st.session_state.mode in ("Manual Control", "Target Position", "Hand Tracking")
+        else 0,
+    )
+    st.session_state.mode = mode
+
+    col_m2, col_m3 = st.columns(2)
+    with col_m2:
+        task = st.selectbox(
+            "TASK",
+            ["Free Move", "Reach Target", "Pick & Place"],
+            index=["Free Move", "Reach Target", "Pick & Place"].index(
+                st.session_state.task
+            ),
+        )
+        st.session_state.task = task
+
+    # ---- Hand Tracking panel ----
+    if mode == "Hand Tracking":
+        st.subheader("HAND TRACKING")
+        st.caption(
+            "Index finger tip → workspace target → IK. "
+            "Z is fixed to the working plane (not true depth)."
+        )
+
+        hc1, hc2 = st.columns(2)
+        with hc1:
+            st.session_state.hand_demo = st.checkbox(
+                "Demo Mode (synthetic hand)",
+                value=st.session_state.hand_demo,
+            )
+        with hc2:
+            alpha = st.slider(
+                "Smoothing α",
+                0.05,
+                1.0,
+                float(st.session_state.hand_smoothing),
+                0.05,
+            )
+            st.session_state.hand_smoothing = alpha
+
+        mapper = CoordinateMapper(
+            camera=CameraBounds(0, 640, 0, 480),
+            workspace=WorkspaceBounds(-180, 180, -120, 120, z=50.0),
+            invert_v=True,
+        )
+        smoother = st.session_state.get("hand_smoother")
+        if smoother is None or abs(smoother.alpha - alpha) > 1e-12:
+            smoother = ExponentialSmoother(alpha=alpha, dim=3)
+            st.session_state.hand_smoother = smoother
+
+        if st.session_state.hand_demo:
+            st.info("SIMULATION — synthetic landmarks (not real camera)")
+            if st.button("STEP DEMO"):
+                _run_demo_hand(model, mapper, smoother)
+                st.rerun()
+        else:
+            cam = st.camera_input("Point camera at your hand", key="hand_cam")
+            if cam is not None:
+                img = Image.open(cam)
+                # Resize for performance
+                img = img.resize((640, 480))
+                rgb = np.array(img.convert("RGB"))
+                _process_hand_frame(rgb, model, mapper, smoother)
+                st.image(
+                    st.session_state.hand_annotated if st.session_state.hand_annotated is not None else rgb,
+                    caption="Camera frame · 21 landmarks · red = index fingertip",
+                    use_container_width=True,
+                )
+
+        # Telemetry
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Status", st.session_state.hand_status)
+        t2.metric("Gesture", st.session_state.hand_gesture)
+        t3.metric("Confidence", f"{st.session_state.hand_confidence:.2f}")
+
+        tgt = st.session_state.target
+        st.write(
+            f"**Target**  X={tgt[0]:.1f}  Y={tgt[1]:.1f}  Z={tgt[2]:.1f} mm  ·  "
+            f"FSM={st.session_state.gesture_fsm}"
+        )
+        if st.session_state.last_ik is not None:
+            ik = st.session_state.last_ik
+            st.write(
+                f"IK: {'VALID' if ik.success else 'FAIL'}  ·  "
+                f"error={ik.position_error:.2f} mm"
+            )
+        st.write(f"**Safety:** {st.session_state.hand_ik_status}")
+
+        tracker = get_hand_tracker()
+        st.caption(f"Backend: {tracker.backend} · Landmarks: 21 · Index tip control")
+
+    # ---- 3D View ----
+    fk = forward_kinematics(model, st.session_state.joint_angles)
+    traj_pts = None
+    if st.session_state.traj_history is not None:
+        traj_pts = np.array(
+            [s.end_effector_position for s in st.session_state.traj_history]
+        )
+
+    show_target = mode in ("Target Position", "Hand Tracking") or task != "Free Move"
+    scene_traces = scene.get_plotly_traces()
+    fig = create_robot_figure(
+        model,
+        st.session_state.joint_angles,
+        target=st.session_state.target if show_target else None,
+        trajectory_points=traj_pts,
+        scene_objects=scene_traces,
+        title=f"{scene.name} · 3-DOF Arm",
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    # ---- Status ----
+    if st.session_state.status_msg:
+        if st.session_state.status_type == "success":
+            st.success(st.session_state.status_msg)
+        elif st.session_state.status_type == "error":
+            st.error(st.session_state.status_msg)
+        else:
+            st.info(st.session_state.status_msg)
+
+    # ---- EE metrics ----
+    ee = fk.end_effector_position
+    m1, m2, m3 = st.columns(3)
+    m1.metric("X (mm)", f"{ee[0]:.1f}")
+    m2.metric("Y (mm)", f"{ee[1]:.1f}")
+    m3.metric("Z (mm)", f"{ee[2]:.1f}")
+
+    # ---- Manual joints ----
+    if mode == "Manual Control" and task == "Free Move":
+        st.subheader("JOINTS")
+        limits_deg = [
+            (np.degrees(lo), np.degrees(hi)) for lo, hi in model.joint_limits
+        ]
+        j1 = st.slider(
+            "J1 (base yaw) °",
+            float(limits_deg[0][0]),
+            float(limits_deg[0][1]),
+            float(deg(st.session_state.joint_angles[0])),
+            step=1.0,
+        )
+        j2 = st.slider(
+            "J2 (shoulder) °",
+            float(limits_deg[1][0]),
+            float(limits_deg[1][1]),
+            float(deg(st.session_state.joint_angles[1])),
+            step=1.0,
+        )
+        j3 = st.slider(
+            "J3 (elbow) °",
+            float(limits_deg[2][0]),
+            float(limits_deg[2][1]),
+            float(deg(st.session_state.joint_angles[2])),
+            step=1.0,
+        )
+        new_angles = np.array([rad(j1), rad(j2), rad(j3)])
+        if not np.allclose(new_angles, st.session_state.joint_angles):
+            st.session_state.joint_angles = new_angles
+            st.session_state.trajectory = None
+            st.session_state.traj_history = None
+            st.rerun()
+
+        a1, a2, a3 = st.columns(3)
+        a1.metric("θ1", f"{j1:.1f}°")
+        a2.metric("θ2", f"{j2:.1f}°")
+        a3.metric("θ3", f"{j3:.1f}°")
+
+    # ---- Target mode ----
+    if mode == "Target Position" or (
+        mode != "Hand Tracking" and task in ("Reach Target", "Pick & Place")
+    ):
+        st.subheader("TARGET")
+        tcol1, tcol2, tcol3 = st.columns(3)
+        with tcol1:
+            tx = st.number_input(
+                "X (mm)", value=float(st.session_state.target[0]), step=5.0
+            )
+        with tcol2:
+            ty = st.number_input(
+                "Y (mm)", value=float(st.session_state.target[1]), step=5.0
+            )
+        with tcol3:
+            tz = st.number_input(
+                "Z (mm)", value=float(st.session_state.target[2]), step=5.0
+            )
+        st.session_state.target = np.array([tx, ty, tz])
+
+        if task == "Pick & Place":
+            targets = scene.get_pick_place_targets()
+            if st.button("LOAD PICK → PLACE"):
+                st.session_state.target = targets["pick"]
+                st.session_state.status_msg = (
+                    "Pick position loaded. Press MOVE TO TARGET, then load place."
+                )
+                st.session_state.status_type = "info"
+                st.rerun()
+
+        if st.button("MOVE TO TARGET", type="primary"):
+            _execute_move_to_target(model)
+
+        if st.session_state.last_ik is not None:
+            ik = st.session_state.last_ik
+            st.write(f"**IK status:** {ik.message}")
+            if ik.success:
+                st.write(
+                    f"Solution (deg): {[round(deg(a), 1) for a in ik.joint_angles]}"
+                )
+                st.write(f"Position error: {ik.position_error:.3f} mm")
+
+    # ---- Trajectory metrics ----
+    if st.session_state.trajectory is not None:
+        traj = st.session_state.trajectory
+        st.subheader("TRAJECTORY METRICS")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Duration", f"{traj.duration:.2f} s")
+        c2.metric("Path length", f"{traj.path_length:.3f} rad")
+        c3.metric("Max vel", f"{traj.max_velocity:.3f} rad/s")
+        c4.metric("Max acc", f"{traj.max_acceleration:.3f} rad/s²")
+
+        if st.checkbox("Show trajectory graphs", value=False):
+            st.plotly_chart(
+                create_trajectory_plots(traj),
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+
+    # ---- Workspace ----
+    with st.expander("Workspace view"):
+        ws = get_workspace_points(model)
+        ws_fig = create_workspace_figure(
+            model,
+            ws,
+            current_ee=fk.end_effector_position,
+            target=st.session_state.target,
+        )
+        st.plotly_chart(
+            ws_fig, use_container_width=True, config={"displayModeBar": False}
+        )
+
+    # ---- Sensor / PID ----
+    with st.expander("Sensor & PID foundation"):
+        noise = st.checkbox("Sensor noise ON", value=st.session_state.noise_on)
+        st.session_state.noise_on = noise
+        st.caption(
+            "JointPositionSensor adds Gaussian noise when enabled. "
+            "PIDController is available for closed-loop experiments."
+        )
+        if st.button("Demo PID step response"):
+            _run_pid_demo(model)
+
+    # ---- Reset ----
+    if st.button("RESET"):
+        st.session_state.joint_angles = np.zeros(model.joint_count)
+        st.session_state.target = np.array([150.0, 0.0, 150.0])
+        st.session_state.last_ik = None
+        st.session_state.trajectory = None
+        st.session_state.traj_history = None
+        st.session_state.hand_status = "NO HAND"
+        st.session_state.gesture_fsm = "IDLE"
+        st.session_state.status_msg = "Reset to home configuration."
+        st.session_state.status_type = "info"
+        st.rerun()
+
+    st.markdown("---")
+    st.caption(
+        "Dubotic Lab v0.2 · Hand → Target → IK → Robot · Core independent of UI"
+    )
+
+
+def _execute_move_to_target(model: RobotModel):
+    target = st.session_state.target
+    if not is_reachable(model, target):
+        st.session_state.status_msg = (
+            "Target unreachable (outside geometric workspace)."
+        )
+        st.session_state.status_type = "error"
+        st.session_state.last_ik = None
+        return
+
+    ik = inverse_kinematics(model, target)
+    st.session_state.last_ik = ik
+
+    if not ik.success:
+        st.session_state.status_msg = ik.message
+        st.session_state.status_type = "error"
+        return
+
+    planner = TrajectoryPlanner(model, default_duration=2.0)
+    traj = planner.plan(
+        st.session_state.joint_angles, ik.joint_angles, n_points=80
+    )
+    st.session_state.trajectory = traj
+
+    sim = Simulation(
+        model=model,
+        state=update_state_from_fk(model, st.session_state.joint_angles),
+    )
+    history = sim.run_trajectory(traj)
+    st.session_state.traj_history = history
+    st.session_state.joint_angles = ik.joint_angles.copy()
+
+    st.session_state.status_msg = (
+        f"Moved to target. Error = {ik.position_error:.3f} mm · "
+        f"Duration = {traj.duration:.2f} s"
+    )
+    st.session_state.status_type = "success"
+
+
+def _run_pid_demo(model: RobotModel):
+    start = st.session_state.joint_angles.copy()
+    goal = model.clamp_joints(np.array([0.5, 0.3, -0.4]))
+    sensor = JointPositionSensor(
+        noise_enabled=st.session_state.noise_on, noise_std=0.02
+    )
+    sim = Simulation(
+        model=model,
+        state=update_state_from_fk(model, start),
+        sensor=sensor,
+        dt=0.02,
+    )
+    history = []
+    for _ in range(150):
+        state = sim.step(goal)
+        history.append(state.copy())
+        if np.linalg.norm(state.joint_angles - goal) < 0.02:
+            break
+    st.session_state.traj_history = history
+    st.session_state.joint_angles = history[-1].joint_angles
+    st.session_state.status_msg = (
+        f"PID demo finished in {len(history) * sim.dt:.2f} s "
+        f"(noise={'ON' if st.session_state.noise_on else 'OFF'})"
+    )
+    st.session_state.status_type = "success"
+
+
+if __name__ == "__main__":
+    main()
